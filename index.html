@@ -1,0 +1,583 @@
+<!doctype html>
+<html lang="pt-BR">
+ <head><script src="/_sdk/telemetry_sdk.js"></script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>City Crime Top-Down</title>
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;700;900&amp;display=swap" rel="stylesheet">
+  <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'DM Sans', sans-serif; overflow: hidden; background: #000; }
+        canvas { display: block; }
+        .hud { position: fixed; top: 0; left: 0; right: 0; pointer-events: none; z-index: 10; }
+        .hud-item { pointer-events: auto; }
+        .minimap { position: fixed; bottom: 16px; left: 16px; border: 2px solid #ffab00; border-radius: 4px; z-index: 10; }
+        .mission-panel { position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%); z-index: 20; max-height: 80vh; overflow-y: auto; }
+        .controls-hint { position: fixed; bottom: 16px; right: 16px; z-index: 10; font-size: 11px; color: #ccc; background: rgba(0,0,0,0.7); padding: 8px 12px; border-radius: 6px; }
+    </style>
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.263.0/dist/umd/lucide.min.js" type="text/javascript"></script>
+  <script src="/_sdk/resizing_sdk.js" type="text/javascript"></script>
+ </head>
+ <body data-template-id="__page-root">
+  <canvas id="game"></canvas>
+  <canvas id="minimap" class="minimap" width="160" height="160"></canvas>
+  <div class="hud p-4 flex justify-between items-start">
+   <div class="flex flex-col gap-1">
+    <div class="flex items-center gap-2 bg-black/70 px-3 py-1 rounded">
+     <span style="color:#ff4444">❤️</span>
+     <div class="w-32 h-3 bg-gray-800 rounded overflow-hidden">
+      <div id="health-bar" class="h-full bg-red-500 transition-all" style="width:100%"></div>
+     </div>
+    </div>
+    <div id="wanted-display" class="bg-black/70 px-3 py-1 rounded text-yellow-400 text-sm">
+     ⭐ 0
+    </div>
+   </div>
+   <div class="flex flex-col items-end gap-1">
+    <div id="money-display" class="bg-black/70 px-3 py-1 rounded text-green-400 font-bold text-lg">
+     $0
+    </div>
+    <div id="weapon-display" class="bg-black/70 px-3 py-1 rounded text-white text-sm">
+     👊 Punho
+    </div>
+    <div id="ammo-display" class="bg-black/70 px-3 py-1 rounded text-gray-300 text-xs hidden">
+     Munição: 0
+    </div>
+   </div>
+  </div>
+  <div id="mission-panel" class="mission-panel hidden bg-gray-900/95 text-white p-6 rounded-xl w-96 border border-yellow-500/50">
+   <h2 class="text-xl font-bold mb-4 text-yellow-400">📋 Missões</h2>
+   <div id="mission-list"></div>
+   <p class="text-xs text-gray-400 mt-4">Pressione M para fechar</p>
+  </div>
+  <div id="msg-display" class="fixed top-20 left-1/2 -translate-x-1/2 z-20 bg-black/80 text-yellow-300 px-4 py-2 rounded-lg font-bold hidden"></div>
+  <div class="controls-hint">
+   WASD: Mover | E: Entrar/Sair veículo | Click: Atacar | 1-3: Armas | M: Missões | R: Salvar
+  </div>
+  <script src="/_sdk/editing_sdk.js"></script>
+  <script src="/_sdk/data_sdk.js"></script>
+  <script>
+    (function(){
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const mmCanvas = document.getElementById('minimap');
+    const mmCtx = mmCanvas.getContext('2d');
+
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+    window.addEventListener('resize', () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; });
+
+    const MAP_W = 8000, MAP_H = 8000;
+    const TILE = 64;
+
+    // Game state
+    let gameData = [];
+    let money = 0, health = 100, wanted = 0, missionsCompleted = 0;
+    let weapons = ['fist'];
+    let currentWeapon = 0;
+    const weaponInfo = {
+        fist: { name: '👊 Punho', damage: 10, range: 40, rate: 400, ammo: Infinity },
+        bat: { name: '🏏 Bastão', damage: 25, range: 55, rate: 500, ammo: Infinity },
+        pistol: { name: '🔫 Pistola', damage: 40, range: 300, rate: 300, ammo: 30 }
+    };
+    let ammo = { pistol: 30 };
+
+    // Player
+    const player = { x: 4000, y: 4000, w: 20, h: 20, speed: 3, angle: 0, inVehicle: null, color: '#00bfff' };
+
+    // Generate roads grid
+    const roads = [];
+    for(let i = 0; i < MAP_W; i += 400) roads.push({x: i, y: 0, w: 48, h: MAP_H, dir: 'v'});
+    for(let i = 0; i < MAP_H; i += 400) roads.push({x: 0, y: i, w: MAP_W, h: 48, dir: 'h'});
+
+    // Buildings
+    const buildings = [];
+    for(let bx = 100; bx < MAP_W - 200; bx += 400){
+        for(let by = 100; by < MAP_H - 200; by += 400){
+            const w = 80 + Math.random()*160, h = 80 + Math.random()*160;
+            const ox = bx + 60 + Math.random()*40, oy = by + 60 + Math.random()*40;
+            if(ox + w < bx + 350 && oy + h < by + 350){
+                buildings.push({x: ox, y: oy, w, h, color: `hsl(${Math.random()*60+10},${20+Math.random()*30}%,${30+Math.random()*20}%)`});
+            }
+        }
+    }
+
+    // Vehicles
+    const vehicles = [];
+    const carColors = ['#e53935','#1e88e5','#43a047','#fdd835','#8e24aa','#ff6d00','#ffffff','#37474f'];
+    for(let i = 0; i < 60; i++){
+        const rx = roads[Math.floor(Math.random()*roads.length)];
+        vehicles.push({
+            x: rx.dir==='v' ? rx.x+10+Math.random()*20 : Math.random()*MAP_W,
+            y: rx.dir==='h' ? rx.y+10+Math.random()*20 : Math.random()*MAP_H,
+            w: 40, h: 22, angle: rx.dir==='v' ? Math.PI/2 : 0,
+            speed: 0, maxSpeed: 6, color: carColors[Math.floor(Math.random()*carColors.length)],
+            health: 100, lastX: 0, lastY: 0
+        });
+    }
+
+    // NPCs (pedestrians)
+    const npcs = [];
+    for(let i = 0; i < 80; i++){
+        npcs.push({
+            x: Math.random()*MAP_W, y: Math.random()*MAP_H, w: 14, h: 14,
+            speed: 0.8 + Math.random()*0.5, angle: Math.random()*Math.PI*2,
+            health: 50, alive: true, isPolice: false, timer: Math.random()*200,
+            color: `hsl(${Math.random()*360},60%,50%)`
+        });
+    }
+
+    // Police
+    const police = [];
+    for(let i = 0; i < 15; i++){
+        police.push({
+            x: Math.random()*MAP_W, y: Math.random()*MAP_H, w: 16, h: 16,
+            speed: 2.5, angle: Math.random()*Math.PI*2,
+            health: 100, alive: true, isPolice: true, timer: 0, chasing: false,
+            color: '#1565c0', shootTimer: 0
+        });
+    }
+
+    // Pickups
+    const pickups = [];
+    function spawnPickups(){
+        const types = ['money','health','bat','pistol','ammo'];
+        for(let i = 0; i < 40; i++){
+            pickups.push({
+                x: Math.random()*MAP_W, y: Math.random()*MAP_H,
+                type: types[Math.floor(Math.random()*types.length)], collected: false
+            });
+        }
+    }
+    spawnPickups();
+
+    // Missions
+    const missions = [
+        {id:1, name:'Entrega Rápida', desc:'Vá ao ponto amarelo e entregue o pacote', target:{x:1500,y:1500}, reward:500, done:false, active:false},
+        {id:2, name:'Eliminar Alvo', desc:'Encontre e elimine o alvo vermelho', target:{x:5500,y:2000}, reward:1000, done:false, active:false, isKill:true},
+        {id:3, name:'Roubar Carro', desc:'Roube um carro e leve ao ponto', target:{x:6500,y:6500}, reward:750, done:false, active:false, needsCar:true},
+        {id:4, name:'Corrida', desc:'Chegue ao destino em 30s', target:{x:2000,y:6000}, reward:1200, done:false, active:false, timed:true, timeLimit:30},
+        {id:5, name:'Coletor', desc:'Colete 3 pacotes espalhados', target:{x:3000,y:3000}, reward:800, done:false, active:false},
+    ];
+    let activeMission = null, missionTimer = 0;
+
+    // Input
+    const keys = {};
+    let mouseX = 0, mouseY = 0, mouseDown = false;
+    document.addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; handleKey(e.key.toLowerCase()); });
+    document.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+    canvas.addEventListener('mousemove', e => { mouseX = e.clientX; mouseY = e.clientY; });
+    canvas.addEventListener('mousedown', e => { mouseDown = true; attack(); });
+    canvas.addEventListener('mouseup', () => mouseDown = false);
+
+    let lastAttack = 0;
+    function attack(){
+        const now = Date.now();
+        const w = weaponInfo[weapons[currentWeapon]];
+        if(now - lastAttack < w.rate) return;
+        if(weapons[currentWeapon]==='pistol' && ammo.pistol <= 0) return;
+        lastAttack = now;
+        if(weapons[currentWeapon]==='pistol') ammo.pistol--;
+
+        const px = player.inVehicle ? player.inVehicle.x : player.x;
+        const py = player.inVehicle ? player.inVehicle.y : player.y;
+        const worldMX = px + (mouseX - canvas.width/2);
+        const worldMY = py + (mouseY - canvas.height/2);
+        const angle = Math.atan2(worldMY - py, worldMX - px);
+
+        // Check hits
+        const allTargets = [...npcs, ...police];
+        for(const npc of allTargets){
+            if(!npc.alive) continue;
+            const dx = npc.x - px, dy = npc.y - py;
+            const dist = Math.sqrt(dx*dx+dy*dy);
+            if(dist > w.range) continue;
+            const a = Math.atan2(dy, dx);
+            if(Math.abs(a - angle) < 0.4 || dist < 50){
+                npc.health -= w.damage;
+                if(npc.health <= 0){ npc.alive = false; if(npc.isPolice) wanted = Math.min(5, wanted+1); else wanted = Math.min(5, wanted+0.5); }
+            }
+        }
+        wanted = Math.min(5, Math.round(wanted*10)/10);
+    }
+
+    function handleKey(k){
+        if(k === 'e') toggleVehicle();
+        if(k === 'm') document.getElementById('mission-panel').classList.toggle('hidden');
+        if(k === '1') currentWeapon = 0;
+        if(k === '2' && weapons.includes('bat')) currentWeapon = weapons.indexOf('bat');
+        if(k === '3' && weapons.includes('pistol')) currentWeapon = weapons.indexOf('pistol');
+        if(k === 'r') saveGame();
+    }
+
+    function toggleVehicle(){
+        if(player.inVehicle){
+            player.x = player.inVehicle.x + 40;
+            player.y = player.inVehicle.y;
+            player.inVehicle.speed = 0;
+            player.inVehicle = null;
+        } else {
+            for(const v of vehicles){
+                const dx = v.x - player.x, dy = v.y - player.y;
+                if(Math.sqrt(dx*dx+dy*dy) < 50){ player.inVehicle = v; break; }
+            }
+        }
+    }
+
+    function checkAABBCollision(x1,y1,w1,h1, x2,y2,w2,h2){
+        return x1 < x2+w2 && x1+w1 > x2 && y1 < y2+h2 && y1+h1 > y2;
+    }
+
+    function resolveVehicleCollision(v1, v2){
+        const dx = v2.x - v1.x, dy = v2.y - v1.y;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        if(dist === 0) return;
+        const nx = dx/dist, ny = dy/dist;
+        const overlap = (v1.w+v2.w)/2 - dist/2;
+        v1.x -= nx*overlap*0.5;
+        v1.y -= ny*overlap*0.5;
+        v2.x += nx*overlap*0.5;
+        v2.y += ny*overlap*0.5;
+        const relSpeed = Math.abs(v1.speed - v2.speed);
+        if(relSpeed > 0.5){
+            const dmg = relSpeed * 10;
+            v1.health -= dmg;
+            v2.health -= dmg;
+        }
+    }
+
+    function showMsg(txt, dur=2000){
+        const el = document.getElementById('msg-display');
+        el.textContent = txt; el.classList.remove('hidden');
+        setTimeout(()=> el.classList.add('hidden'), dur);
+    }
+
+    function updateHUD(){
+        document.getElementById('health-bar').style.width = health+'%';
+        document.getElementById('money-display').textContent = '$'+money;
+        document.getElementById('wanted-display').textContent = '⭐'.repeat(Math.floor(wanted)) + (wanted%1>=0.5?'☆':'') + ' ' + Math.floor(wanted);
+        document.getElementById('weapon-display').textContent = weaponInfo[weapons[currentWeapon]].name;
+        const ammoEl = document.getElementById('ammo-display');
+        if(weapons[currentWeapon]==='pistol'){ ammoEl.classList.remove('hidden'); ammoEl.textContent='Munição: '+ammo.pistol; }
+        else ammoEl.classList.add('hidden');
+    }
+
+    function renderMissions(){
+        const list = document.getElementById('mission-list');
+        list.innerHTML = missions.map(m => `
+            <div class="mb-3 p-3 rounded ${m.done?'bg-green-900/50':'bg-gray-800'} border ${m===activeMission?'border-yellow-400':'border-gray-700'}">
+                <div class="flex justify-between"><span class="font-bold">${m.name}</span><span class="text-green-400">$${m.reward}</span></div>
+                <p class="text-xs text-gray-400 mt-1">${m.desc}</p>
+                ${!m.done && m!==activeMission ? `<button onclick="startMission(${m.id})" class="mt-2 px-3 py-1 bg-yellow-500 text-black rounded text-xs font-bold">Aceitar</button>` : ''}
+                ${m.done ? '<span class="text-green-400 text-xs">✓ Completa</span>' : ''}
+            </div>
+        `).join('');
+    }
+
+    window.startMission = function(id){
+        activeMission = missions.find(m=>m.id===id);
+        activeMission.active = true;
+        if(activeMission.timed) missionTimer = activeMission.timeLimit * 60;
+        showMsg('Missão: ' + activeMission.name);
+        renderMissions();
+    };
+
+    function checkMission(){
+        if(!activeMission || activeMission.done) return;
+        const px = player.inVehicle ? player.inVehicle.x : player.x;
+        const py = player.inVehicle ? player.inVehicle.y : player.y;
+        const dx = activeMission.target.x - px, dy = activeMission.target.y - py;
+        const dist = Math.sqrt(dx*dx+dy*dy);
+
+        if(activeMission.needsCar && !player.inVehicle) return;
+        if(activeMission.timed){ missionTimer--; if(missionTimer<=0){ showMsg('Missão falhou!'); activeMission.active=false; activeMission=null; return; }}
+
+        if(dist < 60){
+            activeMission.done = true;
+            money += activeMission.reward;
+            missionsCompleted++;
+            showMsg('Missão completa! +$' + activeMission.reward);
+            activeMission = null;
+            renderMissions();
+        }
+    }
+
+    // Game loop
+    let frame = 0;
+    function update(){
+        frame++;
+        const spd = player.inVehicle ? player.inVehicle.maxSpeed : player.speed;
+        let dx=0, dy=0;
+
+        if(player.inVehicle){
+            const v = player.inVehicle;
+            if(keys['w']||keys['arrowup']) v.speed = Math.min(v.maxSpeed, v.speed+0.15);
+            else if(keys['s']||keys['arrowdown']) v.speed = Math.max(-2, v.speed-0.1);
+            else v.speed *= 0.97;
+            if(keys['a']||keys['arrowleft']) v.angle -= 0.04 * (v.speed/v.maxSpeed);
+            if(keys['d']||keys['arrowright']) v.angle += 0.04 * (v.speed/v.maxSpeed);
+            
+            // Store last position for collision rollback
+            v.lastX = v.x;
+            v.lastY = v.y;
+            
+            v.x += Math.cos(v.angle)*v.speed;
+            v.y += Math.sin(v.angle)*v.speed;
+            v.x = Math.max(0, Math.min(MAP_W, v.x));
+            v.y = Math.max(0, Math.min(MAP_H, v.y));
+
+            // Collision with buildings
+            for(const b of buildings){
+                if(checkAABBCollision(v.x-v.w/2, v.y-v.h/2, v.w, v.h, b.x, b.y, b.w, b.h)){
+                    v.x = v.lastX;
+                    v.y = v.lastY;
+                    v.speed *= -0.5;
+                    v.health -= 10;
+                    break;
+                }
+            }
+
+            // Collision with other vehicles
+            for(const other of vehicles){
+                if(other === v) continue;
+                if(checkAABBCollision(v.x-v.w/2, v.y-v.h/2, v.w, v.h, other.x-other.w/2, other.y-other.h/2, other.w, other.h)){
+                    resolveVehicleCollision(v, other);
+                }
+            }
+
+            // Hit NPCs
+            if(Math.abs(v.speed) > 2){
+                [...npcs,...police].forEach(n => {
+                    if(!n.alive) return;
+                    const d = Math.sqrt((n.x-v.x)**2+(n.y-v.y)**2);
+                    if(d < 30){ n.health -= 60; if(n.health<=0){n.alive=false; wanted=Math.min(5,wanted+(n.isPolice?2:0.5));} }
+                });
+            }
+        } else {
+            if(keys['w']||keys['arrowup']) dy = -spd;
+            if(keys['s']||keys['arrowdown']) dy = spd;
+            if(keys['a']||keys['arrowleft']) dx = -spd;
+            if(keys['d']||keys['arrowright']) dx = spd;
+            if(keys[' ']){ dx*=1.6; dy*=1.6; }
+            let nx = player.x+dx, ny = player.y+dy;
+            // Collision with buildings
+            let blocked = false;
+            for(const b of buildings){
+                if(nx>b.x && nx<b.x+b.w && ny>b.y && ny<b.y+b.h){ blocked=true; break; }
+            }
+            if(!blocked){ player.x=Math.max(0,Math.min(MAP_W,nx)); player.y=Math.max(0,Math.min(MAP_H,ny)); }
+        }
+
+        // Pickups
+        const px = player.inVehicle ? player.inVehicle.x : player.x;
+        const py = player.inVehicle ? player.inVehicle.y : player.y;
+        pickups.forEach(p => {
+            if(p.collected) return;
+            if(Math.sqrt((p.x-px)**2+(p.y-py)**2) < 30){
+                p.collected = true;
+                if(p.type==='money'){ money+=100; showMsg('+$100'); }
+                if(p.type==='health'){ health=Math.min(100,health+25); }
+                if(p.type==='bat' && !weapons.includes('bat')){ weapons.push('bat'); showMsg('Bastão obtido!'); }
+                if(p.type==='pistol' && !weapons.includes('pistol')){ weapons.push('pistol'); showMsg('Pistola obtida!'); }
+                if(p.type==='ammo'){ ammo.pistol+=15; showMsg('+15 munição'); }
+            }
+        });
+
+        // NPC AI
+        npcs.forEach(n => {
+            if(!n.alive) return;
+            n.timer--;
+            if(n.timer <= 0){ n.angle = Math.random()*Math.PI*2; n.timer = 100+Math.random()*200; }
+            n.x += Math.cos(n.angle)*n.speed;
+            n.y += Math.sin(n.angle)*n.speed;
+            n.x = Math.max(0, Math.min(MAP_W, n.x));
+            n.y = Math.max(0, Math.min(MAP_H, n.y));
+        });
+
+        // Police AI
+        police.forEach(p => {
+            if(!p.alive) return;
+            p.chasing = wanted >= 1 && Math.sqrt((p.x-px)**2+(p.y-py)**2) < 800;
+            if(p.chasing){
+                const a = Math.atan2(py-p.y, px-p.x);
+                p.x += Math.cos(a)*p.speed;
+                p.y += Math.sin(a)*p.speed;
+                // Police shoot
+                const dist = Math.sqrt((p.x-px)**2+(p.y-py)**2);
+                if(dist < 200 && frame%60===0){ health -= 5; }
+            } else {
+                p.timer--;
+                if(p.timer<=0){ p.angle=Math.random()*Math.PI*2; p.timer=150+Math.random()*150; }
+                p.x += Math.cos(p.angle)*1;
+                p.y += Math.sin(p.angle)*1;
+            }
+            p.x = Math.max(0, Math.min(MAP_W, p.x));
+            p.y = Math.max(0, Math.min(MAP_H, p.y));
+        });
+
+        // Wanted decay
+        if(frame%300===0 && wanted>0) wanted = Math.max(0, wanted-0.5);
+
+        // Mission check
+        if(frame%30===0) checkMission();
+
+        // Death
+        if(health<=0){ health=100; wanted=0; player.x=4000; player.y=4000; player.inVehicle=null; money=Math.max(0,money-200); showMsg('Você morreu! -$200'); }
+
+        updateHUD();
+    }
+
+    function render(){
+        const camX = (player.inVehicle ? player.inVehicle.x : player.x) - canvas.width/2;
+        const camY = (player.inVehicle ? player.inVehicle.y : player.y) - canvas.height/2;
+
+        ctx.fillStyle = '#2e7d32';
+        ctx.fillRect(0,0,canvas.width,canvas.height);
+
+        ctx.save();
+        ctx.translate(-camX, -camY);
+
+        // Roads
+        ctx.fillStyle = '#424242';
+        roads.forEach(r => ctx.fillRect(r.x, r.y, r.w, r.h));
+
+        // Road lines
+        ctx.strokeStyle = '#ffeb3b';
+        ctx.setLineDash([20,20]);
+        ctx.lineWidth = 2;
+        roads.forEach(r => {
+            ctx.beginPath();
+            if(r.dir==='v'){ ctx.moveTo(r.x+24,r.y); ctx.lineTo(r.x+24,r.y+r.h); }
+            else { ctx.moveTo(r.x,r.y+24); ctx.lineTo(r.x+r.w,r.y+24); }
+            ctx.stroke();
+        });
+        ctx.setLineDash([]);
+
+        // Buildings
+        buildings.forEach(b => {
+            ctx.fillStyle = b.color;
+            ctx.fillRect(b.x, b.y, b.w, b.h);
+            ctx.strokeStyle = '#1a1a1a';
+            ctx.strokeRect(b.x, b.y, b.w, b.h);
+        });
+
+        // Pickups
+        pickups.forEach(p => {
+            if(p.collected) return;
+            const colors = {money:'#4caf50',health:'#f44336',bat:'#ff9800',pistol:'#9c27b0',ammo:'#607d8b'};
+            const icons = {money:'$',health:'+',bat:'B',pistol:'P',ammo:'A'};
+            ctx.fillStyle = colors[p.type];
+            ctx.beginPath(); ctx.arc(p.x,p.y,10,0,Math.PI*2); ctx.fill();
+            ctx.fillStyle='#fff'; ctx.font='bold 10px DM Sans'; ctx.textAlign='center'; ctx.fillText(icons[p.type],p.x,p.y+4);
+        });
+
+        // Vehicles
+        vehicles.forEach(v => {
+            ctx.save();
+            ctx.translate(v.x, v.y);
+            ctx.rotate(v.angle);
+            ctx.fillStyle = v === player.inVehicle ? '#00e5ff' : v.color;
+            ctx.fillRect(-v.w/2,-v.h/2,v.w,v.h);
+            ctx.fillStyle = '#222';
+            ctx.fillRect(v.w/2-8,-v.h/2+2,6,v.h-4);
+            ctx.restore();
+        });
+
+        // NPCs
+        npcs.forEach(n => {
+            if(!n.alive) return;
+            ctx.fillStyle = n.color;
+            ctx.beginPath(); ctx.arc(n.x,n.y,7,0,Math.PI*2); ctx.fill();
+        });
+
+        // Police
+        police.forEach(p => {
+            if(!p.alive) return;
+            ctx.fillStyle = p.chasing ? '#ff1744' : '#1565c0';
+            ctx.beginPath(); ctx.arc(p.x,p.y,8,0,Math.PI*2); ctx.fill();
+            ctx.fillStyle='#fff'; ctx.font='8px DM Sans'; ctx.textAlign='center'; ctx.fillText('P',p.x,p.y+3);
+        });
+
+        // Player (if not in vehicle)
+        if(!player.inVehicle){
+            ctx.fillStyle = player.color;
+            ctx.beginPath(); ctx.arc(player.x,player.y,10,0,Math.PI*2); ctx.fill();
+            ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.stroke();
+        }
+
+        // Mission marker
+        if(activeMission && !activeMission.done){
+            const t = activeMission.target;
+            ctx.fillStyle = '#ffeb3b';
+            ctx.beginPath(); ctx.moveTo(t.x,t.y-20); ctx.lineTo(t.x-12,t.y); ctx.lineTo(t.x+12,t.y); ctx.closePath(); ctx.fill();
+            ctx.fillStyle='#000'; ctx.font='bold 12px DM Sans'; ctx.textAlign='center'; ctx.fillText('!',t.x,t.y-5);
+        }
+
+        ctx.restore();
+
+        // Minimap
+        mmCtx.fillStyle = '#1b5e20';
+        mmCtx.fillRect(0,0,160,160);
+        const scale = 160/MAP_W;
+        mmCtx.fillStyle = '#555';
+        roads.forEach(r => mmCtx.fillRect(r.x*scale,r.y*scale,Math.max(1,r.w*scale),Math.max(1,r.h*scale)));
+        mmCtx.fillStyle = '#00bfff';
+        const mpx = (player.inVehicle?player.inVehicle.x:player.x)*scale;
+        const mpy = (player.inVehicle?player.inVehicle.y:player.y)*scale;
+        mmCtx.fillRect(mpx-2,mpy-2,4,4);
+        if(activeMission){
+            mmCtx.fillStyle='#ffeb3b';
+            mmCtx.fillRect(activeMission.target.x*scale-2,activeMission.target.y*scale-2,4,4);
+        }
+    }
+
+    function loop(){ update(); render(); requestAnimationFrame(loop); }
+    renderMissions();
+    loop();
+
+    // Data SDK
+    const handler = {
+        onDataChanged(data){
+            gameData = data;
+            if(data.length > 0){
+                const save = data[0];
+                money = save.money || 0;
+                missionsCompleted = save.missions_completed || 0;
+                if(save.weapons_unlocked){
+                    const w = save.weapons_unlocked.split(',');
+                    w.forEach(wp => { if(wp && !weapons.includes(wp)) weapons.push(wp); });
+                }
+                if(save.position_x) player.x = save.position_x;
+                if(save.position_y) player.y = save.position_y;
+                for(let i=0;i<missionsCompleted&&i<missions.length;i++) missions[i].done=true;
+                renderMissions();
+                updateHUD();
+            }
+        }
+    };
+    window.dataSdk.init(handler);
+
+    async function saveGame(){
+        const saveData = {
+            save_name: 'autosave',
+            money,
+            missions_completed: missionsCompleted,
+            weapons_unlocked: weapons.join(','),
+            position_x: Math.round(player.inVehicle?player.inVehicle.x:player.x),
+            position_y: Math.round(player.inVehicle?player.inVehicle.y:player.y)
+        };
+        if(gameData.length > 0){
+            const result = await window.dataSdk.update({...gameData[0], ...saveData});
+            if(result.isOk) showMsg('Jogo salvo!');
+            else showMsg('Erro ao salvar');
+        } else {
+            const result = await window.dataSdk.create(saveData);
+            if(result.isOk) showMsg('Jogo salvo!');
+            else showMsg('Erro ao salvar');
+        }
+    }
+    })();
+    </script>
+ <script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a131fc8a440af198',t:'MTc4MjcwNTIzMC4wMDAwMDA='};var a=document.createElement('script');a.nonce='';a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</html>
